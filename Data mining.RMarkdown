@@ -1,0 +1,1844 @@
+---
+title: "Progetto Data Mining"
+author: "Kevin Capano 844018, Sara Licaj 846892, Susanna Maugeri 839365"
+date: "Appello del 23 febbraio 2021"
+output: pdf_document
+---
+
+Il dataset considerato, reperito su Kaggle, contiene delle informazioni su degli asteroidi vicini alla Terra. Si compone di 40 variabili e 4687 osservazioni.
+
+Alcune delle variabili di interesse sono:
+- Hazardous: variabile target, indica se l'asteroide è pericoloso o meno.
+- Neo.Reference.ID, codice identificativo dell'asteoride.
+- Name, nome dell'asteroide.
+- Absolute.Magnitude, magnitudine assoluta, unità di misura della luminosità intrinseca di un oggetto celeste.
+- Est.Dia.in.KM.min e Est.Dia.in.KM.max, stima minima e massima del diametro dell'asteoride in KM. Le stesse informazioni sono riportate anche in metri, miglia e piedi.
+- Relative.Velocity.km.per.sec, velocità relativa dell'asteroide. La stessa informazione è riportata anche in chilometri orari e miglia orarie.
+- Miss.Dist..kilometers, La stessa informazione è riportata anche in distanza lunare, unità astronimiche e miglia.
+- Orbiting.Body, pianeta nella cui orbita ciascun asteroide si trova.
+- Jupiter.Tisserand.Invariant: parametro di Tisserand per l'asteroide.
+- Eccentricity: valore di eccentricità dell'orbita dell'asteroide.
+- Semi Major Axis: valore del semiasse maggiore dell'orbita dell'asteroide.
+- Orbital Period: tempo impiegato per una rivoluzione completa attorno al pianeta.
+- Perihelion Distance: distanza dell'asteroide al perielio.
+- Aphelion Dist: distanza dell'asteroide all'afelio.
+
+Lo scopo della classificazione è quello di identificare asteroidi potenzialmente pericolosi, per esempio quelli che potrebbero entrare in collisione con la Terra.
+
+
+# Importazione del dataset e controlli preliminari
+
+```{r}
+library(readxl)
+dataset <- read.csv("nasa.csv", sep=',')
+```
+
+Dataset è il dataset originale.
+
+
+## Ricodificazione del target
+
+Hazaordous è la variabile target originale, ha livelli True e False ed è di tipo char, tuttavia Caret richiede che il target sia di tipo factor e considera come event la label più "bassa": per questo si è deciso di etichettare l'event "asteroide pericoloso" con c0 e il non-event "asteoride non pericoloso" con c1.
+
+```{r}
+dataset$Hazardous=ifelse(dataset$Hazardous=="False","c1","c0")
+dataset$Hazardous=as.factor(dataset$Hazardous)
+```
+
+
+## Bilanciamento del dataset
+
+```{r}
+table(dataset$Hazardous)
+prop.table(table(dataset$Hazardous))
+```
+
+Il dataset sembra essere stato bilanciato, in quanto la percentuale di asteroidi pericolosi non è realistica in quanto troppo elevata. Tuttavia, nei metadati del dataset non è stato dichiarato un bilanciamento, si assume che delle priors verosimili siano 1% per gli asteoridi pericolosi e 99% per quelli non pericolosi. Si tratta di un dataset altamente sbilanciato che è stato manipolato.
+Teniamo conto delle true priorseffettuando la correzione allo step 3, dopo la scelta del miglior modello:
+
+```{r}
+true_priors=0.01
+names(true_priors)="c0"
+true_priors
+```
+
+
+## Ricerca delle magagne
+
+```{r}
+library(funModeling)
+library(dplyr)
+stato=df_status(dataset, print_results=F)
+head(stato%>% arrange(type))
+```
+
+L'unica variabile factor presente è il target, mentre 4 variabili sono di tipo character e riguardano le date e il nome del corpo attorno a cui orbita ciascun asteroide. Tutte le restanti variabili sono di tipo numerico.
+
+```{r}
+head(stato%>% arrange(-p_zeros))
+```
+
+Osserviamo che nel dataset solamente Orbit.Uncertainity ha degli zeri, più precisamente il 28.87% di tutti i suoi valori.
+
+```{r}
+stato%>% arrange(unique)
+```
+
+Si osserva che Orbiting.Body e Equinox sono variabili degeneri, quindi creano problemi di Zero Variance.
+
+```{r}
+head(stato%>% arrange(-unique))
+```
+
+Le uniche variabili che hanno un valore diverso per ciascuna osservazione sono quelle che riguardano la velocità.
+Si ipotizza che la variabile ID non rientri tra queste perché alcuni asteroidi vengono osservati più volte.
+
+```{r}
+head(stato%>% arrange(-p_na))
+```
+
+Infine, non si osservano missing values da imputare.
+
+## Pulizia del dataset
+Si decide di non considerare le 3 variabili relative all'identifcazione degli asteroidi, in quanto non utili all'analisi, le 2 variabili degeneri, Orbiting.Body e Equinox, e le 2 variabili che contengono date.
+
+```{r}
+dataset <- dataset[ , names(dataset) != "ï..Neo.Reference.ID"]
+dataset <- dataset[ , names(dataset) != "Name"]
+dataset <- dataset[ , names(dataset) != "Orbit.ID"]
+dataset <- dataset[ , names(dataset) != "Orbiting.Body"]
+dataset <- dataset[ , names(dataset) != "Equinox"]
+dataset <- dataset[ , names(dataset) != "Close.Approach.Date"]
+dataset <- dataset[ , names(dataset) != "Orbit.Determination.Date"]
+```
+
+In questo modo le variabili in nasa sono 33 e si è risolto il problema Zero Variance di cui soffrono quasi tutti i modelli.
+
+
+# Step 1: build models (decide models, preprocessing, tuning, model selection) 
+- preprocessing adeguato per ciascun modello, step di miglioramento
+- craere vari modelli sul training che non overfittino
+- scegliere complessità usando cross validation sul training
+
+Dividiamo covariate qualitative e quantitative:
+
+```{r}
+target <- dataset[, "Hazardous"]
+str(target)
+
+numeric <- sapply(dataset, function(x) is.numeric(x))
+numericdata <-dataset[, numeric]
+#str(numericdata)
+```
+
+Numeric è la lista delle variabili numeriche, numericdata è un dataset che contiene solo le variabili numeriche.
+
+
+## Pre-Processing
+
+### Collinearity
+Eliminazione manuale di tutte le covariate che creano problemi di collinearità.
+Otteniamo così il dataset in cui mancano solo le variabili ID, data e variabili degeneri, che è nasa, e un dataset dove sono state tolte tutte le variabili collineari, nasa_nocorr.
+In questo modo possiamo facilmente applicare ciascun modello a un dataset o all'altro in base al fatto che necessiti della sistemazione della collinearità o meno.
+E, dove va risolta la collinearità, siamo sicuri che vengano tenute delle variabili coerenti tra poco per l'interpretazione perchè tutte con la stessa unità di misura.
+
+Prima di elimimare da nasa tutte le variabili che provocano perfetta collinearità, creiamo una copia di dataset nasa_corr su cui potremo provare ad applicare i modelli che non soffrono di collinearità.
+
+Ora da nasa eliminiamo le variabili collineari.
+
+```{r}
+require(corrgram)
+corrgram(numericdata, lower.panel = panel.cor, cex=1, cex.labels = 1)
+```
+
+Tra alcune variabili vi è correlazione perfetta.
+
+```{r}
+ls(dataset)
+```
+
+```{r}
+library(caret)
+R = cor(numericdata)
+correlatedPredictors = findCorrelation(R, cutoff = 0.9, names = TRUE)
+correlatedPredictors
+```
+
+```{r}
+dataset$Miss.Dist..KM. <- dataset$Miss.Dist..miles.*1.60934
+```
+
+Sono 34.
+
+Alcune variabili esprimono le stesse misure con unità diverse, teniamo i km.
+
+```{r}
+dataset <- dataset[ , names(dataset) != "Est.Dia.in.Miles.min."]
+dataset <- dataset[ , names(dataset) != "Est.Dia.in.M.min."]
+dataset <- dataset[ , names(dataset) != "Est.Dia.in.Feet.min."]
+
+dataset <- dataset[ , names(dataset) != "Est.Dia.in.Miles.max."]
+dataset <- dataset[ , names(dataset) != "Est.Dia.in.Feet.max."]
+dataset <- dataset[ , names(dataset) != "Est.Dia.in.M.max."]
+
+dataset <- dataset[ , names(dataset) != "Relative.Velocity.km.per.hr"]
+
+dataset <- dataset[ , names(dataset) != "Miss.Dist..lunar."]
+dataset <- dataset[ , names(dataset) != "Miss.Dist..Astronomical."]
+dataset <- dataset[ , names(dataset) != "Miss.Dist..miles."]
+```
+
+Così le variabili sono 24.
+Vediamo quali sono ora quelle ancora perfettamente correlate.
+
+
+```{r}
+numeric2 <- sapply(dataset, function(x) is.numeric(x))
+numericdata2 <-dataset[, numeric2]
+
+corrgram(numericdata2, lower.panel = panel.cor, cex=1, cex.labels = 1)
+
+R2 = cor(numericdata2)
+correlatedPredictors2 = findCorrelation(R2, cutoff = 0.9, names = TRUE)
+correlatedPredictors2
+```
+
+- Est.Dia.in.KM.min. e Est.Dia.in.KM.max. sono perfettamente correlate: ne teniamo una sola delle due e la chiamiamo semplicemente Est.Dia.in.KM..
+- Relative.Velocity.km.per.sec e Miles.per.hour sono perfettamente correlate: teniamo solo Relative.Velocity.km.per.sec.
+- Semi.Major.Axis e Orbital.Period sono perfettamente correlate: teniamo Orbital.Period (ho scelto io a caso, ma possiamo tenere l'altra se volete).
+- Semi.Major.Axis è perfettamente correlata anche con Aphelion.Dist: avendola eliminata si dovrebbe risolvere.
+- Ma anche Orbital.Period e Aphelion.Dist sono perfettamente correlate: teniamo Orbital.Period.
+- Perihelion.Time è perfettamente correlata con Epoch.Osculation: teniamo Perihelion.Time.
+- Jupiter.Tisserand.Invariant è perfettamente correlata con Mean.Motion: teniamo Mean.Motion.
+- Miss.Dist..kilometers. è perfettamente correlata con quella creata da noi Miss.Dist..KM.: teniamo Miss.Dist..KM. per avere una nomenclatura il più regolare possibile.
+
+```{r}
+dataset$Est.Dia.in.KM. <- dataset$Est.Dia.in.KM.min.
+dataset <- dataset[ , names(dataset) != "Est.Dia.in.KM.min."]
+dataset <- dataset[ , names(dataset) != "Est.Dia.in.KM.max."]
+
+dataset <- dataset[ , names(dataset) != "Miles.per.hour"]
+dataset <- dataset[ , names(dataset) != "Semi.Major.Axis"]
+dataset <- dataset[ , names(dataset) != "Aphelion.Dist"]
+dataset <- dataset[ , names(dataset) != "Epoch.Osculation"]
+dataset <- dataset[ , names(dataset) != "Jupiter.Tisserand.Invariant"]
+dataset <- dataset[ , names(dataset) != "Miss.Dist..kilometers."]
+```
+
+Così in nasa ci sono 17 variabili.
+Vediamo se alcune sono ancora correlate eccessivamente tra loro.
+
+```{r}
+numeric3 <- sapply(dataset, function(x) is.numeric(x))
+numericdata3 <-dataset[, numeric3]
+
+corrgram(numericdata3, lower.panel = panel.cor, cex=1, cex.labels = 1)
+
+R3 = cor(numericdata3)
+correlatedPredictors3 = findCorrelation(R3, cutoff = 0.9, names = TRUE)
+correlatedPredictors3
+```
+
+Ci sono ancora variabili correlate tra loro, ma non in modo eccessivo.
+Ora possiamo lavorare su nasa.
+Ricordiamoci che quando fittiamo modelli sensibili alla collinearità dobbiamo inserire l'opzione di preprocessing 'corr', poichè non è completamente risolto. 
+
+
+### zero variance and near zero variance predictors 
+For many models (excluding tree-based models), zv or nzv may cause the model to crash or the fit to be unstable
+
+```{r}
+nzv = nearZeroVar(dataset, saveMetrics = TRUE)
+nzv
+```
+
+Non osserviamo variabili con problemi nzv.
+
+Dataset su cui fittare i modelli: nasa.
+
+```{r}
+library(caret)
+set.seed(1)
+cpart=createDataPartition(y=dataset$Hazardous, times=1, p=.95)
+nasa=dataset[cpart$Resample1,]
+score_data=dataset[-cpart$Resample1,]
+
+dim(nasa)
+dim(score_data)
+prop.table(table(score_data$Hazardous))
+```
+
+Nasa è il dataset su cui verranno svolte le analisi, mentre score_data è un dataset che contiene il 5% dei dati iniziali che verrà utilizzato per effettuare lo score.
+
+Ora dividiamo il dataset in train e validation
+
+```{r}
+set.seed(1)
+cpart=createDataPartition(y=nasa$Hazardous, times=1, p=.7)
+train.df=nasa[cpart$Resample1,]
+test.df=nasa[-cpart$Resample1,]
+
+dim(train.df)
+dim(test.df)
+```
+
+
+```{r}
+prop.table(table(train.df$Hazardous))
+prop.table(table(test.df$Hazardous))
+```
+
+Ha estratto stratificando per il target
+
+# Modelli
+Per il nostro dataset decidiamo di tunare i modelli massimizzando la sensitivity, cioè di ridurre al minimo gli asteroidi classificati come non pericolosi che però in realtà sono pericolosi.
+
+
+## 1) Naive Bayes
+
+```{r Tuning nb}
+set.seed(1)
+ctrl =trainControl(method="cv",
+                   number=10,
+                   classProbs=T,
+                   summaryFunction=twoClassSummary)
+naivebayes=train(Hazardous~.,
+                 data=train.df,
+                 method="naive_bayes",
+                 preProcess=c("corr"),
+                 metric="Sens",
+                 trControl=ctrl,
+                 tuneLength=5,
+                 na.action=na.pass) 
+naivebayes
+```
+
+Il modello è stato tunato con caret e non con klaR perché non si propongono i due problemi che caret non gestisce bene: non vi sono variabili categoriali e non vi sono missing values.
+
+Per questo modello non ha senso fare il plot dei parametri di tuning poiché non vi sono parametri di tuning. L'unica scelta da effettuare è la scelta tra un kernel gaussiano e uno empirico.
+
+```{r Performance nb}
+getTrainPerf(naivebayes)
+```
+
+```{r CM train nb}
+pred_nb=predict(naivebayes, newdata=train.df)
+confusionMatrix(pred_nb, train.df$Hazardous)
+```
+
+```{r CM test nb}
+pred_test_nb_caret <- predict(naivebayes, test.df, type="raw")
+confusionMatrix(pred_test_nb_caret, test.df$Hazardous)
+```
+
+
+## 2) Analisi discriminante
+
+```{r Tuning lda}
+set.seed(1)
+Control = trainControl(method="cv",
+                       number=10,
+                       classProbs=TRUE,
+                       summaryFunction=twoClassSummary)
+lda <- train(Hazardous~.,
+             data=train.df,
+             method="lda",
+             trControl=Control,
+             metric="Sens",
+             tuneLength=5)
+lda
+```
+
+```{r CM train lda}
+pred_lda=predict(lda, newdata=train.df)
+confusionMatrix(pred_lda, train.df$Hazardous)
+```
+
+```{r CM test lda}
+pred_test_lda <- predict(lda, test.df, type="raw")
+confusionMatrix(pred_test_lda, test.df$Hazardous)
+```
+
+Questo modello non overfitta, tuttavia la metrica della Sensitivity non è molto soddisfacente.
+
+
+## 3) Albero Caret
+
+```{r Tuning caret tree}
+set.seed(1)
+cvCtrl <- trainControl(method="cv",
+                       number=10,
+                       search="grid",
+                       classProbs=TRUE,
+                       summaryFunction=twoClassSummary)
+tree_caret <- train(Hazardous~.,
+              data=train.df,
+              method="rpart",
+              tuneLength=15,
+              metric="Sens",
+              trControl=cvCtrl)
+tree_caret
+```
+
+```{r Plot tree}
+plot(tree_caret)
+```
+
+```{r Performance tree}
+getTrainPerf(tree_caret)
+```
+
+Visualizzazione grafica dell'albero decisionale:
+
+```{r}
+library(rattle)
+fancyRpartPlot(tree_caret$finalModel)
+```
+
+```{r CM train tree}
+pred_tree_caret=predict(tree_caret, newdata=train.df)
+confusionMatrix(pred_tree_caret, train.df$Hazardous)
+```
+
+```{r CM test tree}
+pred_test_tree_caret <- predict(tree_caret, test.df, type="raw")
+confusionMatrix(pred_test_tree_caret, test.df$Hazardous)
+```
+
+La sensitivity per il dataset di training e di validation non cambia per più del 10%: il modello non overfitta.
+
+
+### Model selection
+Estrazione delle variabili importanti:
+
+```{r}
+Importanza_var_tree_caret <- varImp(tree_caret)
+plot(Importanza_var_tree_caret)
+```
+
+Possiamo considerare come importanti le variabili che hanno importanza maggiore di 5.
+
+```{r}
+Importanza_var_tree_caret
+```
+
+```{r}
+variabili_tree_caret=as.data.frame(Importanza_var_tree_caret$importance)
+vars=subset(variabili_tree_caret, Overall>5)
+vars2=t(vars)
+Xselected=nasa[,colnames(vars2)]
+dati_tree_caret=cbind(Xselected, target)
+head(dati_tree_caret)
+dim(dati_tree_caret)
+```
+
+Divisione di dati_tree_caret in training e test:
+
+```{r}
+set.seed(1)
+cpart=createDataPartition(y=dati_tree_caret$target, times=1, p=.7)
+dati_tree_caret_train=dati_tree_caret[cpart$Resample1,]
+dati_tree_caret_test=dati_tree_caret[-cpart$Resample1,]
+
+dim(dati_tree_caret_train)
+dim(dati_tree_caret_test)
+```
+
+Con questi dataset che contenogno una selezione ristretta di variabili si possono applicare altri modelli che richiedono model selection.
+
+
+## 4) KNN con dataset selezionato con Tree_caret
+
+```{r}
+set.seed(1)
+ctrl =trainControl(method="cv",
+                   number = 10,
+                   classProbs = T,
+                   summaryFunction=twoClassSummary)
+grid = expand.grid(k=seq(5, 20, 3))
+knn_tree_caret=train(target~.,
+          data=dati_tree_caret_train,
+          method = "knn",
+          trControl = ctrl,
+          tuneLength=5,
+          metric="Sens",
+          na.action = na.pass,
+          tuneGrid=grid,
+          preProcess=c("scale", "corr"))
+knn_tree_caret
+```
+
+```{r Plot knn}
+plot(knn_tree_caret)
+```
+
+```{r Performance knn}
+getTrainPerf(knn_tree_caret)
+```
+
+```{r CM train knn}
+pred_knn_tree_caret=predict(knn_tree_caret, newdata=dati_tree_caret_train)
+confusionMatrix(pred_knn_tree_caret, dati_tree_caret_train$target)
+```
+
+```{r CM test knn}
+pred_test_knn_tree_caret <- predict(knn_tree_caret, dati_tree_caret_test, type="raw")
+confusionMatrix(pred_test_knn_tree_caret, dati_tree_caret_test$target)
+```
+
+Il modello non overfitta perché le metriche sens e spec su dataset di training e di test non differiscono di molto.
+
+
+## 5) Neural Network con dataset selezionato da Tree_caret
+
+```{r Tuning nn}
+set.seed(1)
+ctrl = trainControl(method="cv",
+                    number=10,
+                    search="grid",
+                    classProbs=TRUE,
+                    summaryFunction=twoClassSummary)
+tunegrid <- expand.grid(size=c(1:6), decay=c(0.001, 0.01, 0.1))
+nnet_tree_caret <- train(target~.,
+                   data=dati_tree_caret_train,
+                   method="nnet",
+                   metric="Sens",
+                   tuneGrid=tunegrid,
+                   preProcess=c("scale","BoxCox", "corr"),
+                   trControl=ctrl,
+                   trace=F, #use true to see convergence
+                   maxit=250)
+nnet_tree_caret
+```
+
+```{r Plot nn}
+plot(nnet_tree_caret)
+```
+
+```{r Performance nn}
+getTrainPerf(nnet_tree_caret)
+```
+
+Confusion Matrix sul training:
+
+```{r CM train nn}
+pred_nnet_tree_caret=predict(nnet_tree_caret, newdata=dati_tree_caret_train)
+confusionMatrix(pred_nnet_tree_caret, dati_tree_caret_train$target)
+```
+
+Confusion Matrix sul test set:
+
+```{r CM test nn}
+pred_test_nnet_tree_caret=predict(nnet_tree_caret, newdata=dati_tree_caret_test)
+confusionMatrix(pred_test_nnet_tree_caret, dati_tree_caret_test$target)
+```
+
+Anche questo modello non overfitta perchè la difefrenza delle metriche di sens e spec sui dataset di training e di test differiscono di poco.
+
+
+## 6) Logistico Boosted con dataset selezionato da Tree_caret
+
+```{r Tuning lb}
+set.seed(1)
+control <- trainControl(method="cv",
+                        number=10,
+                        search="grid",
+                        summaryFunction=twoClassSummary,
+                        classProbs = TRUE)
+tunegrid <- expand.grid(nIter=seq(from = 150, to = 350, by = 50))
+logit_boost_tree_caret <- train(target~.,
+                          metric="Sens",
+                          data=dati_tree_caret_train,
+                          method="LogitBoost",
+                          tuneGrid=tunegrid,
+                          verbose=TRUE,
+                          trControl=control)
+logit_boost_tree_caret
+```
+
+```{r Plot lb}
+plot(logit_boost_tree_caret)
+```
+
+```{r Performance lb}
+getTrainPerf(logit_boost_tree_caret)
+```
+
+```{r CM train lb}
+pred_logboost_tree_caret <- predict(logit_boost_tree_caret, dati_tree_caret_train, type="raw")
+confusionMatrix(pred_logboost_tree_caret, dati_tree_caret_train$target)
+```
+
+```{r CM test lb}
+pred_test_logboost_tree_caret <- predict(logit_boost_tree_caret, dati_tree_caret_test, type="raw")
+confusionMatrix(pred_test_logboost_tree_caret, dati_tree_caret_test$target)
+```
+
+
+## 7) Gradient Boosting con dataset selezionato da Tree_Caret
+
+```{r Tuning gb tree caret}
+set.seed(1)
+control <- trainControl(method="cv",
+                        number=10,
+                        summaryFunction=twoClassSummary,
+                        classProbs=TRUE,
+                        search="grid")
+grad_boost_tree_caret <- train(target~.,
+                         data=dati_tree_caret_train,
+                         method="gbm",
+                         trControl=control,
+                         metric="Sens",
+                         verbose=FALSE,
+                         tuneGrid=data.frame(interaction.depth=c(4:10),
+                                             n.trees=150,
+                                             shrinkage=0.05,
+                                             n.minobsinnode=50))
+grad_boost_tree_caret
+```
+
+```{r Plot gb tree caret}
+plot(grad_boost_tree_caret)
+```
+
+```{r Performance gb tree caret}
+getTrainPerf(grad_boost_tree_caret)
+```
+
+```{r CM train gb tree caret}
+pred_grad_boost_tree_caret <- predict(grad_boost_tree_caret, dati_tree_caret_train, type="raw")
+confusionMatrix(pred_grad_boost_tree_caret, dati_tree_caret_train$target)
+```
+
+```{r CM test gb tree caret}
+pred_test_grad_boost_tree_caret <- predict(grad_boost_tree_caret, dati_tree_caret_test, type="raw")
+confusionMatrix(pred_test_grad_boost_tree_caret, dati_tree_caret_test$target)
+```
+
+
+## 8) Albero rpart
+
+```{r Tuning rpart}
+library(rpart)
+tree_rp <- rpart(Hazardous~.,
+                   data=train.df,
+                   method="class",
+                   cp=0,
+                   minsplit=1)
+tree_rp
+```
+
+```{r}
+library(rpart.plot)
+rpart.plot(tree_rp, type = 4, extra = 1)
+```
+
+```{r}
+tree_rp$cptable
+```
+
+Con questo metodo quello considerato migliore è quello con cp 0.0018903592, 8 split e 9 livelli.
+
+```{r}
+best_pruned <- prune(tree_rp, cp = 0.0018903592)
+rpart.plot(best_pruned)
+```
+
+```{r CM train rpart}
+pred_tree_bp=predict(best_pruned, newdata=train.df, "class")
+confusionMatrix(pred_tree_bp, train.df$Hazardous)
+```
+
+```{r CM test rpart}
+pred_test_tree_bp <- predict(best_pruned, test.df, type="class")
+confusionMatrix(pred_test_tree_bp, test.df$Hazardous)
+```
+
+Il modello non overfitta perché vi è poca differenza tra le metriche di spec e sens nei due dataset.
+
+
+### Model selection
+Estrazione delle variabili importanti:
+
+```{r}
+Importanza_var_tree_rp <- tree_rp$variable.importance
+Importanza_var_tree_rp
+max(tree_rp$variable.importance)
+```
+
+La variabile che ha importanza maggiore è Absolute.Magnitude, riscalo tutte le importanze rispetto a quella.
+
+```{r}
+options(scipen=999)
+importanza <- tree_rp$variable.importance/776.8938*100
+Importanza_var_tree_rp_100 <- as.data.frame(importanza)
+Importanza_var_tree_rp_100
+```
+
+Possiamo considerare come importanti le variabili che hanno importanza maggiore di 10.
+
+```{r}
+variabili_tree_rp=as.data.frame(Importanza_var_tree_rp_100)
+vars=subset(variabili_tree_rp, importanza>10)
+vars2=t(vars)
+Xselected=nasa[,colnames(vars2)]
+dati_tree_rp=cbind(Xselected, target)
+head(dati_tree_rp)
+dim(dati_tree_rp)
+```
+
+Ricodificazione del target e divisione in training e test:
+
+```{r}
+set.seed(1)
+cpart=createDataPartition(y=dati_tree_rp$target, times=1, p=.7)
+dati_tree_rp_train=dati_tree_rp[cpart$Resample1,]
+dati_tree_rp_test=dati_tree_rp[-cpart$Resample1,]
+
+dim(dati_tree_rp_train)
+dim(dati_tree_rp_test)
+```
+
+
+## 9) KNN con dataset selezionato con Tree_rp
+
+```{r}
+set.seed(1)
+ctrl =trainControl(method="cv",
+                   number=10,
+                   classProbs=T,
+                   summaryFunction=twoClassSummary)
+grid = expand.grid(k=seq(5, 20, 3))
+knn_tree_rp=train(target~.,
+          data=dati_tree_rp_train,
+          method="knn",
+          trControl=ctrl,
+          tuneLength=5,
+          metric="Sens",
+          na.action=na.pass,
+          tuneGrid=grid,
+          preProcess=c("scale", "corr"))
+knn_tree_rp
+```
+
+```{r Plot knn}
+plot(knn_tree_rp)
+```
+
+```{r Performance knn}
+getTrainPerf(knn_tree_caret)
+```
+
+```{r CM train knn}
+pred_knn_tree_rp=predict(knn_tree_rp, newdata=dati_tree_rp_train)
+confusionMatrix(pred_knn_tree_rp, dati_tree_rp_train$target)
+```
+
+```{r CM test knn}
+pred_test_knn_tree_rp <- predict(knn_tree_rp, dati_tree_rp_test, type="raw")
+confusionMatrix(pred_test_knn_tree_rp, dati_tree_rp_test$target)
+```
+
+Il modello non overfitta perché le metriche sens e spec su dataset di training e di test non differiscono di molto.
+
+
+## 10) Neural Network con dataset selezionato con Tree_rp
+
+```{r Tuning nn}
+set.seed(1)
+ctrl = trainControl(method="cv",
+                    number=10,
+                    search="grid",
+                    classProbs=TRUE,
+                    summaryFunction=twoClassSummary)
+tunegrid <- expand.grid(size=c(1:6), decay=c(0.001, 0.01, 0.1))
+nnet_tree_rp <- train(target~.,
+                   data=dati_tree_rp_train,
+                   method="nnet",
+                   metric="Sens",
+                   tuneGrid=tunegrid,
+                   preProcess=c("scale","BoxCox", "corr"),
+                   trControl=ctrl,
+                   trace=F,
+                   maxit=250)
+nnet_tree_rp
+```
+
+Il modello che indica come migliore è quello con 5 neuroni nascosti e tasso di apprendimento 0.1.
+Il modello con 3 neuroni nascosti e tasso di apprendimento 0.1, tuttavia, ha performance di poco inferiori ma una più bassa complessità, quindi potremmo tenerlo in considerazione.
+
+```{r Plot nn}
+plot(nnet_tree_rp)
+```
+
+```{r Performance nn}
+getTrainPerf(nnet_tree_rp)
+```
+
+Confusion Matrix sul training:
+
+```{r CM train nn}
+pred_nnet_tree_rp=predict(nnet_tree_rp, newdata=dati_tree_rp_train)
+confusionMatrix(pred_nnet_tree_rp, dati_tree_rp_train$target)
+```
+
+Confusion Matrix sul test set:
+
+```{r CM test nn}
+pred_test_nnet_tree_rp=predict(nnet_tree_rp, newdata=dati_tree_rp_test)
+confusionMatrix(pred_test_nnet_tree_rp, dati_tree_rp_test$target)
+```
+
+Anche questo modello non overfitta perchè la differenza delle metriche di sens e spec sui dataset di training e di test differiscono di poco.
+
+
+## 11) Gradient Boosting con dataset selezionato da Tree_rp
+
+```{r Tuning gb tree rpart}
+set.seed(1)
+control <- trainControl(method="cv",
+                        number=10,
+                        summaryFunction=twoClassSummary,
+                        classProbs=TRUE,
+                        search="grid")
+grad_boost_tree_rp <- train(target~.,
+                            data=dati_tree_rp_train,
+                            method="gbm",
+                            trControl=control,
+                            metric="Sens",
+                            verbose=FALSE,
+                            tuneGrid=data.frame(interaction.depth=c(4:10),
+                                                n.trees=150,
+                                                shrinkage=0.05,
+                                                n.minobsinnode=50))
+grad_boost_tree_rp
+```
+
+```{r Plot gb tree caret}
+plot(grad_boost_tree_rp)
+```
+
+```{r Performance gb tree caret}
+getTrainPerf(grad_boost_tree_rp)
+```
+
+```{r CM train gb tree caret}
+pred_grad_boost_tree_rp <- predict(grad_boost_tree_rp, dati_tree_rp_train, type="raw")
+confusionMatrix(pred_grad_boost_tree_rp, dati_tree_rp_train$target)
+```
+
+```{r CM test gb tree caret}
+pred_test_grad_boost_tree_rp <- predict(grad_boost_tree_rp, dati_tree_rp_test, type="raw")
+confusionMatrix(pred_test_grad_boost_tree_rp, dati_tree_rp_test$target)
+```
+
+
+## 12) Random Forest
+
+Il numero di variabili da considerare deve essere tunato intorno alla radice quadrata del numero di covariate del dataset. Nel nostro dataset le covariare sono 16, quindi useremo come riferimento il valore 4.
+
+```{r Tuning rf}
+set.seed(1)
+control <- trainControl(method="cv",
+                        number=10,
+                        search="grid",
+                        summaryFunction=twoClassSummary,
+                        classProbs=TRUE)
+tunegrid <- expand.grid(.mtry=c(1:7))
+random_forest <- train(Hazardous~.,
+                       metric="Sens",
+                       data=train.df,
+                       method="rf",
+                       tuneGrid=tunegrid,
+                       ntree=250,
+                       trControl=control)
+random_forest
+```
+
+Il modello migliore è quello che considera sottoinsiemi da 6 covariate ciascuno.
+
+```{r Plot rf}
+plot(random_forest)
+```
+
+```{r Performance rf}
+getTrainPerf(random_forest)
+```
+
+Matrice di confusione sui dati di training.
+
+```{r CM train rf}
+Pred_rf <- predict(random_forest, train.df)
+confusionMatrix(Pred_rf, train.df$Hazardous)
+```
+
+Matrice di confusione sui dati di test:
+Così prediciamo la classe, se volessimo le posteriors: type="prob".
+
+```{r CM test rf}
+pred_test_rf=predict(random_forest, newdata=test.df) 
+confusionMatrix(pred_test_rf, test.df$Hazardous)
+```
+
+Anche questo modello non overfitta sui dati di training.
+
+
+### Model selection
+Estrazione delle variabili importanti:
+
+```{r}
+Importanza_var_rf <- varImp(random_forest)
+plot(Importanza_var_rf)
+```
+
+Possiamo considerare come importanti le variabili che hanno importanza maggiore di 5.
+
+```{r}
+Importanza_var_rf
+```
+
+Anche se hanno valori di importanza differenti, si tratta delle stesse variabili considerate importanti dall'albero tunato con Caret.
+
+
+## 13) Lasso
+
+```{r Tuning lasso}
+set.seed(1)
+ctrl = trainControl(method="cv",
+                    number=10,
+                    classProbs=T,
+                    summaryFunction=twoClassSummary)
+grid = expand.grid(.alpha=1,.lambda=seq(0, 0.15, by = 0.01))
+lasso=train(Hazardous~.,
+            data=train.df,
+            method="glmnet",
+            trControl=ctrl,
+            tuneLength=5,
+            metric="Sens",
+            preProcess="corr",
+            na.action=na.pass,
+            tuneGrid=grid)
+lasso
+```
+
+```{r Plot lasso}
+plot(lasso)
+```
+
+```{r Performance lasso}
+getTrainPerf(lasso)
+```
+
+```{r CM train lasso}
+pred_lasso <- predict(lasso, train.df, type="raw")
+confusionMatrix(pred_lasso, train.df$Hazardous)
+```
+
+```{r CM test lasso}
+pred_test_lasso <- predict(lasso, test.df, type="raw")
+confusionMatrix(pred_test_lasso, test.df$Hazardous)
+```
+
+Coefficienti stimati dal modello:
+
+```{r}
+coef(lasso$finalModel, s=lasso$bestTune$lambda)
+```
+
+Estrazione dei dataset:
+
+```{r Drop vars}
+dati_lasso_train <- train.df
+dati_lasso_train <- dati_lasso_train[ , names(dati_lasso_train) != "Epoch.Date.Close.Approach"]
+dati_lasso_train <- dati_lasso_train[ , names(dati_lasso_train) != "Relative.Velocity.km.per.sec"]
+dati_lasso_train <- dati_lasso_train[ , names(dati_lasso_train) != "Asc.Node.Longitude"]
+dati_lasso_train <- dati_lasso_train[ , names(dati_lasso_train) != "Orbital.Period"]
+dati_lasso_train <- dati_lasso_train[ , names(dati_lasso_train) != "Mean.Anomaly"]
+dati_lasso_train <- dati_lasso_train[ , names(dati_lasso_train) != "Perihelion.Arg"]
+dati_lasso_train <- dati_lasso_train[ , names(dati_lasso_train) != "Perihelion.Time"]
+dati_lasso_train <- dati_lasso_train[ , names(dati_lasso_train) != "Miss.Dist..KM."]
+```
+
+```{r CM test logit boost (lasso mod sel)}
+dati_lasso_test <- test.df
+dati_lasso_test <- dati_lasso_test[ , names(dati_lasso_test) != "Epoch.Date.Close.Approach"]
+dati_lasso_test <- dati_lasso_test[ , names(dati_lasso_test) != "Relative.Velocity.km.per.sec"]
+dati_lasso_test <- dati_lasso_test[ , names(dati_lasso_test) != "Asc.Node.Longitude"]
+dati_lasso_test <- dati_lasso_test[ , names(dati_lasso_test) != "Orbital.Period"]
+dati_lasso_test <- dati_lasso_test[ , names(dati_lasso_test) != "Mean.Anomaly"]
+dati_lasso_test <- dati_lasso_test[ , names(dati_lasso_test) != "Perihelion.Arg"]
+dati_lasso_test <- dati_lasso_test[ , names(dati_lasso_test) != "Perihelion.Time"]
+dati_lasso_test <- dati_lasso_test[ , names(dati_lasso_test) != "Miss.Dist..KM."]
+```
+
+
+## 14) Neural Network su dataset selezionato con Lasso
+
+```{r nnet su lasso model selection}
+set.seed(1)
+ctrl = trainControl(method="cv",
+                    number=10,
+                    search="grid",
+                    classProbs=TRUE,
+                    summaryFunction=twoClassSummary)
+tunegrid <- expand.grid(size=c(1:6), decay=c(0.001, 0.01, 0.1))
+nnet_lasso <- train(Hazardous~.,
+              data=dati_lasso_train,
+              method="nnet",
+              metric="Sens",
+              tuneGrid=tunegrid,
+              preProcess=c("scale","BoxCox", "corr"),
+              trControl=ctrl,
+              trace=F,
+              maxit=200)
+nnet_lasso
+```
+
+```{r Plot nn con lasso mod sel}
+plot(nnet_lasso)
+```
+
+```{r CM train nnet con lasso mod sel}
+pred_nnet_lasso = predict(nnet_lasso, newdata=dati_lasso_train)
+confusionMatrix(pred_nnet_lasso, dati_lasso_train$Hazardous)
+```
+
+```{r CM test nnet con lasso mod sel}
+pred_test_nnet_lasso = predict(nnet_lasso, newdata=dati_lasso_test)
+confusionMatrix(pred_test_nnet_lasso, dati_lasso_test$Hazardous)
+```
+
+Performance quasi identiche alla rete neurale fittata sulle variabili importanti selezionate con albero Caret.
+
+
+## 15) Logistico boosted con dataset selezionato con Lasso
+
+```{r LogitBoost Lasso}
+set.seed(1)
+control <- trainControl(method="cv",
+                        number=10,
+                        search="grid",
+                        summaryFunction=twoClassSummary,
+                        classProbs=TRUE)
+tunegrid <- expand.grid(nIter=seq(from=100, to=250, by=50))
+logit_boost_lasso <- train(Hazardous~.,
+                           metric="Sens",
+                           data=dati_lasso_train,
+                           method="LogitBoost",
+                           tuneGrid=tunegrid,
+                           verbose=TRUE,
+                           trControl=control)
+logit_boost_lasso
+```
+
+```{r CM train logit boost con lasso mod sel}
+pred_logboost_lasso <- predict(logit_boost_lasso, dati_lasso_train, type="raw")
+confusionMatrix(pred_logboost_lasso, dati_lasso_train$Hazardous)
+```
+
+```{r CM test logit boost con lasso mod sel}
+pred_test_logboost_lasso <- predict(logit_boost_lasso, dati_lasso_test, type="raw")
+confusionMatrix(pred_test_logboost_lasso, dati_lasso_test$Hazardous)
+```
+
+Il logistico boosted tunato sul dataset che contiene le variabili selezionate con un albero Caret pare avere performance migliori sul test set rispetto al logistico boosted tunato sul dataset selezionato con un modello Lasso.
+
+
+## 16) Gradient Boosting con dataset selezionato con Lasso
+
+```{r Tuning gb lasso}
+set.seed(1)
+control <- trainControl(method="cv",
+                        number=10,
+                        summaryFunction=twoClassSummary,
+                        classProbs=TRUE,
+                        search="grid")
+grad_boost_lasso <- train(Hazardous~.,
+                          data=dati_lasso_train,
+                          method="gbm",
+                          trControl=control,
+                          metric="Sens",
+                          verbose=FALSE,
+                          tuneGrid=data.frame(interaction.depth=c(4:10),
+                                              n.trees=150,
+                                              shrinkage=0.05,
+                                              n.minobsinnode=50))
+grad_boost_lasso
+```
+
+```{r Plot gb lasso}
+plot(grad_boost_lasso)
+```
+
+```{r Performance gb lasso}
+getTrainPerf(grad_boost_lasso)
+```
+
+```{r CM train gb lasso}
+pred_grad_boost_lasso <- predict(grad_boost_lasso, dati_lasso_train, type="raw")
+confusionMatrix(pred_grad_boost_lasso, dati_lasso_train$Hazardous)
+```
+
+```{r CM test gb lasso}
+pred_test_grad_boost_lasso <- predict(grad_boost_lasso, dati_lasso_test, type="raw")
+confusionMatrix(pred_test_grad_boost_lasso, dati_lasso_test$Hazardous)
+```
+
+
+## 17) Pls
+
+La Partial Least Squares Regression cerca delle combinazioni lineari delle variabili di input che massimizzino la covarianza al quadrato tra ciascuna combinazione lineare e la variabile target. Può essere usata come classificatore in sé oppure come model selector per trovare un sottoinsieme di variabili per tunare altri modelli.
+La model selection si fa col valore del VIP.
+Tunare sia con variabili standardizzate che con variabili originali.
+
+```{r Training pls}
+set.seed(1)
+Control=trainControl(method="cv",
+                     number=10,
+                     classProbs=TRUE,
+                     summaryFunction=twoClassSummary,
+                     search="grid")
+pls=train(Hazardous~.,
+          data=train.df,
+          method="pls",
+          trControl=Control,
+          metric="Sens",
+          tuneLength=10)
+pls
+```
+
+Brutta brutta brutta sensitivity!
+
+```{r}
+plot(pls)
+```
+
+```{r CM train pls}
+pred_pls <- predict(pls, train.df, type="raw")
+confusionMatrix(pred_pls, train.df$Hazardous)
+```
+
+Sensitivity spaventosa. Schifo!!!
+
+```{r CM test pls}
+pred_test_pls <- predict(pls, test.df, type="raw")
+confusionMatrix(pred_test_pls, test.df$Hazardous)
+```
+
+Ancora no buono.
+
+Provo a rifittare lo stesso modello con variabili standardizzate. Se è migliore prendo le variabili (model selection) da quello.
+
+```{r Training pls stand}
+set.seed(1)
+Control=trainControl(method="cv",
+                     number=10,
+                     classProbs=TRUE,
+                     summaryFunction=twoClassSummary,
+                     search="grid")
+pls_stand=train(Hazardous~.,
+          data=train.df,
+          method="pls",
+          trControl=Control,
+          preProcess=c("scale", "BoxCox"),
+          metric="Sens",
+          tuneLength=10)
+pls_stand
+```
+
+Questo con le variabili standardizzate ha una sensitivity migliore di quello precedente, anche se ancora è molto deludente.
+
+```{r}
+plot(pls_stand)
+```
+
+```{r CM train pls stand}
+pred_pls_stand <- predict(pls_stand, train.df, type="raw")
+confusionMatrix(pred_pls_stand, train.df$Hazardous)
+```
+
+```{r CM test pls stand}
+pred_test_pls_stand <- predict(pls_stand, test.df, type="raw")
+confusionMatrix(pred_test_pls_stand, test.df$Hazardous)
+```
+
+
+### Model selection
+Seleziono le variabili importanti dal pls con le variabili standardizzate.
+
+```{r}
+Importanza_var_pls_stand <- varImp(pls_stand)
+plot(Importanza_var_pls_stand)
+```
+
+```{r}
+Importanza_var_pls_stand
+```
+
+Possiamo considerare come importanti le variabili che hanno importanza maggiore di 10.
+
+```{r}
+variabili_pls_stand=as.data.frame(Importanza_var_pls_stand$importance)
+vars=subset(variabili_pls_stand, Overall>10)
+vars2=t(vars)
+Xselected=nasa[,colnames(vars2)]
+dati_pls_stand=cbind(Xselected, target)
+head(dati_pls_stand)
+dim(dati_pls_stand)
+```
+
+Ricodificazione del target e divisione in training e test:
+
+```{r}
+set.seed(1)
+cpart=createDataPartition(y=dati_pls_stand$target, times=1, p=.7)
+dati_pls_stand_train=dati_pls_stand[cpart$Resample1,]
+dati_pls_stand_test=dati_pls_stand[-cpart$Resample1,]
+
+dim(dati_pls_stand_train)
+dim(dati_pls_stand_test)
+```
+
+
+## 18) Logistico con dataset selezionato da PLS stand
+
+```{r}
+set.seed(1)
+Control = trainControl(method="cv",
+                       number=10,
+                       classProbs=TRUE,
+                       summaryFunction=twoClassSummary)
+glm_pls_stand <- train(target~.,
+                 data=dati_pls_stand_train,
+                 method="glm",
+                 trControl=Control,
+                 metric="Sens",
+                 preProcess=c("corr","nzv","BoxCox"),
+                 tuneLength=5)
+glm_pls_stand
+```
+
+```{r CM train glm pls stand}
+pred_glm_pls_stand <- predict(glm_pls_stand, dati_pls_stand_train, type="raw")
+confusionMatrix(pred_glm_pls_stand, dati_pls_stand_train$target)
+```
+ 
+Ci sono 108 asteroidi pericolosi classificati come non pericolosi!
+
+```{r CM test glm pls stand}
+pred_test_glm_pls_stand <- predict(glm_pls_stand, dati_pls_stand_test, type="raw")
+confusionMatrix(pred_test_glm_pls_stand, dati_pls_stand_test$target)
+```
+
+No buono. 48 asteroidi che potrebbero farci estinguere.
+Modelli non molto belli.
+
+
+## 19) Extreme Gradient Boosting
+
+```{r Tuning xgb}
+set.seed(1)
+control <- trainControl(method="cv",
+                        number=10,
+                        search="grid",
+                        summaryFunction=twoClassSummary,
+                        classProbs=TRUE)
+tunegrid <- expand.grid(nrounds=seq(from=100, to=200, by=50),
+                      eta=c(0.025, 0.05, 0.1, 0.3),
+                      max_depth=c(4,6,8),
+                      gamma=0,
+                      colsample_bytree=1,
+                      min_child_weight=1,
+                      subsample=1)
+xgb <- train(Hazardous~.,
+             metric="Sens",
+             data=train.df,
+             method="xgbTree",
+             tuneGrid=tunegrid,
+             verbose=TRUE,
+             trControl=control)
+xgb
+```
+
+```{r Plot xgb}
+plot(xgb)
+```
+
+```{r Performance xgb}
+getTrainPerf(xgb)
+```
+
+```{r CM train xgb}
+pred_xgb=predict(xgb, newdata=train.df)
+confusionMatrix(pred_xgb, train.df$Hazardous)
+```
+
+```{r CM test xgb}
+pred_test_xgb=predict(xgb, newdata=test.df)
+confusionMatrix(pred_test_xgb, test.df$Hazardous)
+```
+
+
+## 20) Rete neurale tunata sulle Componenti Principali
+
+```{r}
+set.seed(1)
+control = trainControl(method="cv",
+                       number=10,
+                       search="grid",
+                       summaryFunction=twoClassSummary,
+                       classProbs=TRUE)
+tunegrid <- expand.grid(size=c(1:6), decay=c(0.001, 0.01, 0.1))
+nn_pca <- train(Hazardous~.,
+                data=train.df,
+                method="nnet",
+                metric="Sens",
+                preProcess="pca",
+                tuneGrid=tunegrid,
+                trControl=control,
+                trace=F,
+                maxit=150)
+nn_pca
+```
+
+Non malissimo, vediamo matrici di confusione.
+
+```{r CM train nn pca}
+pred_nn_pca=predict(nn_pca, newdata=train.df)
+confusionMatrix(pred_nn_pca, train.df$Hazardous)
+```
+
+```{r CM test nn pca}
+pred_test_nn_pca=predict(nn_pca, newdata=test.df)
+confusionMatrix(pred_test_nn_pca, test.df$Hazardous)
+```
+
+Non il massimo ma neanche il modello peggiore che abbiamo visto.
+
+
+## 21) Naive Bayes tunato sulle Componenti Principali
+
+```{r}
+set.seed(1)
+control = trainControl(method="cv",
+                       number=10,
+                       classProbs=T,
+                       summaryFunction=twoClassSummary)
+nb_pca <- train(Hazardous~.,
+                data=train.df,
+                method="naive_bayes",
+                preProcess=c("corr", "pca"),
+                metric="Sens",
+                trControl=control,
+                tuneLength=5,
+                na.action=na.pass)
+nb_pca
+```
+
+```{r CM train egb}
+pred_nb_pca=predict(nb_pca, newdata=train.df)
+confusionMatrix(pred_nb_pca, train.df$Hazardous)
+```
+
+```{r CM test egb}
+pred_test_nb_pca=predict(nb_pca, newdata=test.df)
+confusionMatrix(pred_test_nb_pca, test.df$Hazardous)
+```
+
+Bleh
+
+
+## 22) Gradient Boosting
+
+```{r Tuning gb}
+set.seed(1)
+control <- trainControl(method="cv",
+                        number=10,
+                        summaryFunction=twoClassSummary,
+                        classProbs=TRUE,
+                        search="grid")
+grad_boost <- train(Hazardous~.,
+                          data=train.df,
+                          method="gbm",
+                          trControl=control,
+                          metric="Sens",
+                          verbose=FALSE,
+                          tuneGrid=data.frame(interaction.depth=c(2:12),
+                                              n.trees=250,
+                                              shrinkage=0.2,
+                                              n.minobsinnode=50))
+grad_boost
+```
+
+```{r Plot gb}
+plot(grad_boost)
+```
+
+```{r Performance gb}
+getTrainPerf(grad_boost)
+```
+
+```{r CM train gb}
+pred_grad_boost <- predict(grad_boost, train.df, type="raw")
+confusionMatrix(pred_grad_boost, train.df$Hazardous)
+```
+
+```{r CM test gb}
+pred_test_grad_boost <- predict(grad_boost, test.df, type="raw")
+confusionMatrix(pred_test_grad_boost, test.df$Hazardous)
+```
+
+
+# STEP 2: ASSESSMENT 
+## Confronto tra le curve ROC dei modelli
+
+```{r}
+library(caret)
+results <- resamples(list(nb=naivebayes,
+                          lda=lda,
+                          tree_caret=tree_caret,
+                          knn_tree_caret=knn_tree_caret,
+                          nnet_tree_caret=nnet_tree_caret,
+                          logit_boost_tree_caret=logit_boost_tree_caret,
+                          grad_boost_tree_caret=grad_boost_tree_caret,
+                          #tree_rp=best_pruned,
+                          knn_tree_rp=knn_tree_rp,
+                          nnet_tree_rp=nnet_tree_rp,
+                          grad_boost_tree_rp=grad_boost_tree_rp,
+                          random_forest=random_forest,
+                          lasso=lasso,
+                          nnet_lasso=nnet_lasso,
+                          logit_boost_lasso=logit_boost_lasso,
+                          grad_boost_lasso=grad_boost_lasso,
+                          pls=pls,
+                          pls_stand=pls_stand,
+                          glm_pls_stand=glm_pls_stand,
+                          xgb=xgb,
+                          nn_pca=nn_pca,
+                          nb_pca=nb_pca,
+                          grad_boost=grad_boost))
+bwplot(results)
+```
+
+Posteriors per c0 per ogni modello:
+
+```{r}
+test.df$naivebayes=predict(naivebayes, test.df, "prob")[,1]
+test.df$lda=predict(lda, test.df, type="prob")[,1]
+
+test.df$tree_caret=predict(tree_caret, test.df, "prob")[,1]
+dati_tree_caret_test$knn_tree_caret=predict(knn_tree_caret, dati_tree_caret_test, "prob")[,1]
+dati_tree_caret_test$nnet_tree_caret=predict(nnet_tree_caret, dati_tree_caret_test, "prob")[,1]
+dati_tree_caret_test$logit_boost_tree_caret=predict(logit_boost_tree_caret, dati_tree_caret_test, "prob")[,1]
+dati_tree_caret_test$grad_boost_tree_caret=predict(grad_boost_tree_caret, dati_tree_caret_test, "prob")[,1]
+
+test.df$best_pruned=predict(tree_rp, test.df, "prob")[,1]
+dati_tree_rp_test$knn_tree_rp=predict(knn_tree_rp, dati_tree_rp_test, "prob")[,1]
+dati_tree_rp_test$nnet_tree_rp=predict(nnet_tree_rp, dati_tree_rp_test, "prob")[,1]
+dati_tree_rp_test$grad_boost_tree_rp=predict(grad_boost_tree_rp, dati_tree_rp_test, "prob")[,1]
+
+test.df$random_forest=predict(random_forest, test.df, type="prob")[,1]
+
+test.df$lasso=predict(lasso, test.df, "prob")[,1]
+dati_lasso_test$nnet_lasso=predict(nnet_lasso, dati_lasso_test, "prob")[,1]
+dati_lasso_test$logit_boost_lasso=predict(logit_boost_lasso, dati_lasso_test, "prob")[,1]
+dati_lasso_test$grad_boost_lasso=predict(grad_boost_lasso, dati_lasso_test, "prob")[,1]
+
+test.df$pls=predict(pls, test.df, type="prob")[,1]
+test.df$pls_stand=predict(pls_stand, test.df, type="prob")[,1]
+dati_pls_stand_test$glm_pls_stand=predict(glm_pls_stand, dati_pls_stand_test, type="prob")[,1]
+
+test.df$xgb=predict(xgb, test.df, "prob")[,1]
+
+test.df$nn_pca=predict(nn_pca, test.df, "prob")[,1]
+test.df$nb_pca=predict(nb_pca, test.df, "prob")[,1]
+test.df$grad_boost=predict(grad_boost, test.df, "prob")[,1]
+```
+
+Aree sotto le curve ROC:
+
+```{r}
+library(pROC)
+roc.naivebayes=roc(Hazardous ~ naivebayes, data=test.df); roc.naivebayes
+roc.lda=roc(Hazardous ~ lda, data=test.df); roc.lda
+
+roc.tree_caret=roc(Hazardous ~ tree_caret, data=test.df); roc.tree_caret
+roc.knn_tree_caret=roc(target ~ knn_tree_caret, data=dati_tree_caret_test); roc.knn_tree_caret
+roc.nnet_tree_caret=roc(target ~ nnet_tree_caret, data = dati_tree_caret_test); roc.nnet_tree_caret
+roc.logit_boost_tree_caret=roc(target ~ logit_boost_tree_caret, data=dati_tree_caret_test); roc.logit_boost_tree_caret
+roc.grad_boost_tree_caret=roc(target ~ grad_boost_tree_caret, data=dati_tree_caret_test); roc.grad_boost_tree_caret
+
+roc.tree_rp=roc(Hazardous ~ tree_rp, data=test.df); roc.tree_rp
+roc.knn_tree_rp=roc(target ~ knn_tree_rp, data=dati_tree_rp_test); roc.knn_tree_rp
+roc.nnet_tree_rp=roc(target ~ nnet_tree_rp, data = dati_tree_rp_test); roc.nnet_tree_rp
+roc.grad_boost_tree_rp=roc(target ~ grad_boost_tree_rp, data=dati_tree_rp_test); roc.grad_boost_tree_rp
+
+roc.random_forest=roc(Hazardous ~ random_forest, data = test.df); roc.random_forest
+
+roc.lasso=roc(Hazardous ~ lasso, data=test.df); roc.lasso
+roc.nnet_lasso=roc(Hazardous ~ nnet_lasso, data = dati_lasso_test); roc.nnet_lasso
+roc.logit_boost_lasso=roc(Hazardous ~ logit_boost_lasso, data=dati_lasso_test); roc.logit_boost_lasso
+roc.grad_boost_lasso=roc(Hazardous ~ grad_boost_lasso, data=dati_lasso_test); roc.grad_boost_lasso
+
+roc.pls=roc(Hazardous ~ pls, data=test.df); roc.pls
+roc.pls_stand=roc(Hazardous ~ pls_stand, data=test.df); roc.pls_stand
+roc.glm_pls_stand=roc(target ~ glm_pls_stand, data=dati_pls_stand_test); roc.glm_pls_stand
+
+roc.xgb=roc(Hazardous ~ xgb, data = test.df); roc.xgb
+
+roc.nn_pca=roc(Hazardous ~ nn_pca, data = test.df); roc.nn_pca
+roc.nb_pca=roc(Hazardous ~ nb_pca, data = test.df); roc.nb_pca
+roc.grad_boost=roc(Hazardous ~ grad_boost, data= test.df); roc.grad_boost
+```
+
+
+Plot delle curve ROC:
+
+```{r}
+plot(roc.random_forest, col="black", main="Curve ROC")
+plot(roc.naivebayes, add=T, col="pink")
+plot(roc.lda, add=T, col="yellow")
+
+plot(roc.tree_caret, add=T, col="green")
+plot(roc.knn_tree_caret, add=T, col="green2")
+plot(roc.nnet_tree_caret, add=T, col="darkgreen")
+plot(roc.logit_boost_tree_caret, add=T, col="green3")
+plot(roc.grad_boost_tree_caret, add=T, col="green4")
+
+plot(roc.tree_rp, add=T, col="blue")
+plot(roc.knn_tree_rp, add=T, col="lightblue")
+plot(roc.nnet_tree_rp, add=T, col="lightblue2")
+plot(roc.grad_boost_tree_rp, add=T, col="blue2")
+
+plot(roc.lasso, add=T, col="orange")
+plot(roc.nnet_lasso, add=T, col="red")
+plot(roc.logit_boost_lasso, add=T, col="red2")
+plot(roc.grad_boost_lasso, add=T, col="red3")
+
+plot(roc.pls, add=T, col="purple")
+plot(roc.pls_stand, add=T, col="purple2")
+plot(roc.glm_pls_stand, add=T, col="purple3")
+
+plot(roc.xgb, add=T, col="gray")
+
+plot(roc.nn_pca, add=T, col="brown")
+plot(roc.nb_pca, add=T, col="brown2")
+
+plot(roc.grad_boost, add=T, col="seagreen1")
+
+
+legend("bottomright", legend=c("Naive Bayes",
+                           "LDA",
+                           "Tree Caret",
+                           "K-nn Tree Caret",
+                           "Neural Network Tree Caret",
+                           "Logistico Boosted Tree Caret",
+                           "Gradient Boosting Tree Caret",
+                           "Tree rpart",
+                           "K-nn Tree rpart",
+                           "Neural Network Tree rpart",
+                           "Gradient Boosting Tree rpart",
+                           "Random Forest",
+                           "Lasso",
+                           "Neural Network Lasso",
+                           "Logistico Boosted Lasso",
+                           "Gradient Boosting Lasso",
+                           "PLS",
+                           "PLS vars stand",
+                           "Logistico pls stand",
+                           "Extreme Gradient Boosting",
+                           "Neural Network PCA",
+                           "Naive Bayes PCA",
+                           "Gradient Boosting"),
+       col=c("pink",
+             "yellow",
+             "green",
+             "green2",
+             "darkgreen",
+             "green3",
+             "green4",
+             "blue",
+             "lightblue",
+             "lightblue2",
+             "blue2",
+             "black",
+             "orange",
+             "red",
+             "red2",
+             "red3",
+             "purple",
+             "Purple2",
+             "Purple3",
+             "gray",
+             "brown",
+             "brown2",
+             "seagreen1"),
+       lty=c(1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1),
+       cex=0.65)
+```
+
+Dato che le curve ROC si intersecano, plottiamo le curve lift cercando il classificatore che cattura più "asteroidi pericolosi" nei primi decili (ovvero nelle osservazioni che hanno più probabilità di essere asteroidi pericolosi).
+
+
+## CURVE LIFT
+The lift is calculated as the ratio of the percentage of samples in each split corresponding to class over the same percentage in the entire data set.
+
+```{r}
+lift_test.df=test.df[,c(15, 18:30)]
+lift_dati_tree_caret_test=dati_tree_caret_test[,c(7:11)]
+lift_dati_tree_rp_test=dati_tree_rp_test[,c(7:10)]
+lift_dati_lasso_test=dati_lasso_test[,c(8, 10:12)]
+lift_dati_pls_stand_test=dati_pls_stand_test[,c(11,12)]
+#head(lift_test.df)
+
+trellis.par.set(caretTheme())
+lift_obj1 <- lift(Hazardous ~ naivebayes+lda+tree_caret+random_forest+lasso+pls+pls_stand+xgb+nn_pca+nb_pca+grad_boost, data = lift_test.df)
+plot(lift_obj1, plot= 'lift', values = 100, auto.key = list(columns = 3,
+                                            lines = TRUE,
+                                            points = FALSE))
+```
+
+```{r}
+lift_obj2 <- lift(target ~ knn_tree_caret+nnet_tree_caret+logit_boost_tree_caret+grad_boost_tree_caret, data = lift_dati_tree_caret_test)
+plot(lift_obj2, plot= 'lift', values = 100, auto.key = list(columns = 3,
+                                            lines = TRUE,
+                                            points = FALSE))
+```
+
+```{r}
+lift_obj3 <- lift(target ~ knn_tree_rp+nnet_tree_rp+grad_boost_tree_rp, data = lift_dati_tree_rp_test)
+plot(lift_obj3, plot= 'lift', values = 100, auto.key = list(columns = 3,
+                                            lines = TRUE,
+                                            points = FALSE))
+```
+
+```{r}
+lift_obj4 <- lift(Hazardous ~ nnet_lasso+logit_boost_lasso+grad_boost_lasso, data = lift_dati_lasso_test)
+plot(lift_obj4, plot= 'lift', values = 100, auto.key = list(columns = 3,
+                                            lines = TRUE,
+                                            points = FALSE))
+```
+
+```{r}
+lift_obj5 <- lift(target ~ glm_pls_stand, data = lift_dati_pls_stand_test)
+plot(lift_obj5, plot= 'lift', values = 100, auto.key = list(columns = 3,
+                                            lines = TRUE,
+                                            points = FALSE))
+```
+
+Questa lift è una schifezza, non compete con le altre. Non la mettiamo.
+```{r}
+lift_dati_tree_caret_test$Hazardous <- lift_dati_tree_caret_test$target
+lift_dati_tree_caret_test$target <- NULL
+
+lift_dati_tree_rp_test$Hazardous <- lift_dati_tree_rp_test$target
+lift_dati_tree_rp_test$target <- NULL
+```
+
+
+```{r}
+library(funModeling)
+gain_lift(data = lift_test.df, score = 'random_forest', target = 'Hazardous')
+gain_lift(data = lift_test.df, score = 'xgb', target = 'Hazardous')
+gain_lift(data = lift_test.df, score= 'grad_boost', target = 'Hazardous')
+
+gain_lift(data = lift_dati_tree_caret_test, score = 'logit_boost_tree_caret', target = 'Hazardous')
+gain_lift(data = lift_dati_tree_caret_test, score = 'grad_boost_tree_caret', target = 'Hazardous')
+
+gain_lift(data = lift_dati_tree_rp_test, score = 'nnet_tree_rp', target = 'Hazardous')
+gain_lift(data = lift_dati_tree_rp_test, score = 'grad_boost_tree_rp', target = 'Hazardous')
+
+gain_lift(data = lift_dati_lasso_test, score = 'nnet_lasso', target = 'Hazardous')
+gain_lift(data = lift_dati_lasso_test, score = 'logit_boost_lasso', target = 'Hazardous')
+gain_lift(data = lift_dati_lasso_test, score = 'grad_boost_lasso', target = 'Hazardous')
+```
+
+I migliori sono grad_boost_lasso e logit_boost_lasso, che presentano le stesse curve lift.
+Scegliamo di portare avanti l'analisi con il gradient boosting.
+Il primo 20% della popolazione, ordinata per posterior decrescente, cattura il 100% del totale degli asteroidi pericolosi.
+
+
+# STEP 3
+## Performance del modello classificativo e Scelta della soglia
+
+save validation results: observed target an pred probs
+1=c0=event 2=c1=nonevent
+
+```{r}
+df=data.frame(cbind(dati_lasso_test$Hazardous, dati_lasso_test$grad_boost_lasso, 1-dati_lasso_test$grad_boost_lasso))
+head(df)
+colnames(df)=c("Hazardous","Prob_c0","Prob_c1")
+head(df)
+```
+
+
+## Correzione delle posteriors
+
+```{r}
+prop.table(table(dati_lasso_test$Hazardous))
+```
+
+```{r}
+true_c0 = 0.01
+true_c1 = 0.99
+old_c0 = 0.1610487
+old_c1 = 0.8389513
+
+den=df$Prob_c0*(true_c0/old_c0)+df$Prob_c1*(true_c1/old_c1)
+
+df$pred_c0_true= df$Prob_c0*(true_c0/old_c0)/den
+df$pred_c1_true= df$Prob_c1*(true_c1/old_c1)/den
+
+hist(df$pred_c0_true, main="Frequenza delle probabilità previste", xlab="True Posteriors")
+plot(df$Prob_c0, df$pred_c0_true, main="Comparing posteriors", xlab="Balanced dataset posterios", ylab="Adjusted posteriors")
+```
+
+```{r}
+head(df)
+```
+
+```{r}
+df_treshold=df[,c(1,4)] #selezioniamo solo target osservato e prob evento di interesse
+head(df_treshold)
+```
+
+```{r}
+df_treshold$Hazardous <- ifelse(df_treshold$Hazardous==2, 'Non_Haz', 'Haz')
+head(df_treshold)
+```
+
+```{r}
+thresholds <- seq(from = 0, to = 1, by = 0.01)
+prop_table <- data.frame(threshold = thresholds, Sensitivity = NA, Specificity = NA, true_Haz = NA, true_Non_Haz = NA ,fn_Haz=NA)
+
+for (threshold in thresholds) {
+pred <- ifelse(df_treshold$pred_c0_true > threshold, "Haz", "Non_Haz") # be careful here!!!
+pred_t <- ifelse(pred == df_treshold$Hazardous, TRUE, FALSE)
+
+group <- data.frame(df_treshold, "pred" = pred_t) %>%
+group_by(Hazardous, pred) %>%
+dplyr::summarise(n = n())
+
+group_c0 <- filter(group, Hazardous == "Haz")
+
+true_c0=sum(filter(group_c0, pred == TRUE)$n)
+prop_c0 <- sum(filter(group_c0, pred == TRUE)$n) / sum(group_c0$n)
+
+prop_table[prop_table$threshold == threshold, "Sensitivity"] <- prop_c0
+prop_table[prop_table$threshold == threshold, "true_Haz"] <- true_c0
+
+fn_c0=sum(filter(group_c0, pred == FALSE)$n)
+# true M predicted as R
+prop_table[prop_table$threshold == threshold, "fn_Haz"] <- fn_c0
+
+group_c1 <- filter(group, Hazardous == "Non_Haz")
+
+true_c1=sum(filter(group_c1, pred == TRUE)$n)
+prop_c1 <- sum(filter(group_c1, pred == TRUE)$n) / sum(group_c1$n)
+
+prop_table[prop_table$threshold == threshold, "Specificity"] <- prop_c1
+prop_table[prop_table$threshold == threshold, "true_Non_Haz"] <- true_c1}
+
+head(prop_table, n=10)
+```
+
+
+```{r}
+prop_table$n=nrow(dati_lasso_test)
+
+# false positive (fp_M) by difference of n and tn, tp, fn, si ricava per differenza
+prop_table$fp=nrow(dati_lasso_test)-prop_table$true_Haz-prop_table$true_Non_Haz-prop_table$fn_Haz
+
+# find accuracy, veri positivi e veri negativi sul totale delle righe del valid set
+prop_table$Accuracy=(prop_table$true_Haz+prop_table$true_Non_Haz)/nrow(dati_lasso_test)
+
+# find precision, veri M su totali previsti come M
+prop_table$Precision=prop_table$true_Haz/(prop_table$true_Haz+prop_table$fp)
+
+# find F1 =2*(prec*sens)/(prec+sens)
+# media armonica di precision e sensitivity
+# prop_true_M = sensitivity
+
+prop_table$F1=2*(prop_table$Sensitivity*prop_table$Precision)/(prop_table$Sensitivity+prop_table$Precision)
+prop_table
+```
+
+```{r}
+library(Hmisc)
+prop_table$Precision=impute(prop_table$Precision, 1)
+prop_table$F1=impute(prop_table$F1, 0)
+tail(prop_table)
+```
+
+
+## Grafico finale
+
+```{r}
+prop_table2 = prop_table[,-c(4:8)] 
+head(prop_table2)
+
+#### ora plottiamo: plot measures vs soglia ####
+# before we must impile data vertically: one block for each measure
+library(dplyr)
+library(tidyr)
+
+# impilare le metriche una sopra l'altra
+gathered=prop_table2 %>%
+  gather(x, y, Sensitivity:F1)
+
+head(gathered)
+tail(gathered)
+```
+
+```{r}
+library(ggplot2)
+gathered %>%
+ggplot(aes(x = threshold, y = y, color = x)) +
+geom_point() +
+geom_line() +
+scale_color_brewer(palette = "Set1") +
+labs(y = "Measures", x="Threshold",
+color = "Event: Haz\nNonEvent: Non_Haz")
+```
+
+```{r}
+# zoom
+gathered %>%
+  ggplot(aes(x = threshold, y = y, color = x)) +
+  geom_point() +
+  geom_line() +
+  scale_color_brewer(palette = "Set1") +
+  labs(y = "Measures", x="Threshold",
+       color = "Event: Haz\nNonEvent: Non_Haz") +
+  coord_cartesian(xlim = c(0, 0.03))
+```
+
+Scegliamo, guardando il grafico, una soglia di 0.02.
+
+```{r}
+df_treshold$decision=ifelse(df_treshold$pred_c0_true>0.02, "Haz","Non_Haz")
+df_treshold$Hazardous=as.factor(df_treshold$Hazardous)
+df_treshold$decision=as.factor(df_treshold$decision)
+confusionMatrix(df_treshold$decision, df_treshold$Hazardous)
+```
+
+Il modello sembra avere ottime performance, anche se potrebbe non essere sufficiente per salvare l'umanità.
+
+
+# STEP 4 - SCORE DI NUOVI CASI
+Caricare il dataset di score, generare le posterior e sulla base di quelle creare un codice ifelse
+che generi il target previsto.
+Score_data
+
+```{r}
+score_data$Hazardous <- NULL #eliminiamo il target
+score_data$prob_previste = predict(grad_boost_lasso, score_data, "prob")[,1]
+#head(score_data)
+score_data$target_previsto=ifelse(score_data$prob_previste>0.02, "Haz","Non_Haz")
+head(score_data)
+```
+
+```{r}
+prop.table(table(score_data$target_previsto))
+```
+
